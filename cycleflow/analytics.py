@@ -1,3 +1,4 @@
+import json
 from collections import defaultdict
 from datetime import datetime
 from decimal import Decimal
@@ -49,12 +50,19 @@ class CycleAnalytics:
                     "SELECT r.lot_id,r.quantity,l.part,l.supplier FROM reservations r JOIN lots l ON l.lot_id=r.lot_id WHERE r.job_id=? ORDER BY l.part,r.lot_id",
                     (job_id,)):
                     lots[job_id].append(dict(row))
+            configurations = {row["config_id"]: json.loads(row["mapping"]) for row in db.execute(
+                "SELECT config_id,mapping FROM configurations")}
+            job_subs = defaultdict(list)
+            for row in db.execute(
+                    "SELECT job_id,part,substitute_part,approval_id FROM job_substitutions ORDER BY job_id,part"):
+                job_subs[row["job_id"]].append(dict(row))
             events = [dict(row) for row in db.execute(
                 "SELECT id,kind,state,error_code,occurred_at,payload FROM events WHERE state!='accepted' ORDER BY id")]
             head = db.execute("SELECT COALESCE(MAX(id),0) FROM events").fetchone()[0]
-            revisions = self._revisions(jobs, steps, tests, lots)
+            revisions = self._revisions(jobs, steps, tests, lots, configurations, job_subs)
             job_details = [self._job_detail(job, steps[job["job_id"]], tests[job["job_id"]],
-                                            lots[job["job_id"]]) for job in jobs]
+                                            lots[job["job_id"]], configurations.get(job["config_id"]),
+                                            job_subs[job["job_id"]]) for job in jobs]
             quality = self._quality(jobs, steps, tests, events, design_rows, start, end)
             summary = self._summary(jobs, tests, job_details)
             report = {"product": product, "window_start": start, "window_end": end,
@@ -64,7 +72,7 @@ class CycleAnalytics:
             report["fingerprint"] = fingerprint(report)
             return report
 
-    def _job_detail(self, job, steps, tests, lots):
+    def _job_detail(self, job, steps, tests, lots, configuration, substitutions):
         stages = []
         completed = job["completed_at"]
         for step in steps:
@@ -88,19 +96,31 @@ class CycleAnalytics:
                 "completed_at": completed, "parent_job": job["parent_job"],
                 "failure_reason": job["failure_reason"], "stages": stages,
                 "tests": test_details, "lots": lots, "wait_seconds": wait,
-                "cycle_seconds": total}
+                "cycle_seconds": total, "config_id": job["config_id"],
+                "configuration": configuration, "substitutions": substitutions}
 
-    def _revisions(self, jobs, steps, tests, lots):
+    def _revisions(self, jobs, steps, tests, lots, configurations, job_subs):
         groups = defaultdict(lambda: {"jobs": 0, "units": 0, "tested": 0, "passed": 0,
                                       "failed": 0, "completed": 0, "scrapped": 0,
                                       "cycle_seconds": [], "stage_seconds": defaultdict(list),
-                                      "suppliers": defaultdict(int)})
+                                      "suppliers": defaultdict(int),
+                                      "configurations": defaultdict(
+                                          lambda: {"jobs": 0, "units": 0, "tested": 0,
+                                                   "passed": 0, "failed": 0,
+                                                   "approvals": {}})})
         for job in jobs:
             group = groups[job["revision"]]
             group["jobs"] += 1
             group["units"] += job["quantity"]
             group["completed"] += job["status"] == "completed"
             group["scrapped"] += job["status"] == "scrapped"
+            config_group = group["configurations"][job["config_id"]]
+            config_group["jobs"] += 1
+            config_group["units"] += job["quantity"]
+            for sub in job_subs[job["job_id"]]:
+                config_group["approvals"][sub["approval_id"]] = {
+                    "approval_id": sub["approval_id"], "original_part": sub["part"],
+                    "substitute_part": sub["substitute_part"]}
             if job["completed_at"]:
                 group["cycle_seconds"].append(duration_seconds(job["opened_at"], job["completed_at"]))
             for step in steps[job["job_id"]]:
@@ -111,19 +131,37 @@ class CycleAnalytics:
                 group["tested"] += test["passed"] + test["failed"]
                 group["passed"] += test["passed"]
                 group["failed"] += test["failed"]
+                config_group["tested"] += test["passed"] + test["failed"]
+                config_group["passed"] += test["passed"]
+                config_group["failed"] += test["failed"]
             for lot in lots[job["job_id"]]:
                 group["suppliers"][lot["supplier"]] += lot["quantity"]
         result = []
         for revision in sorted(groups):
             group = groups[revision]
             durations = group["cycle_seconds"]
+            config_entries = []
+            for config_id in sorted(group["configurations"]):
+                config_group = group["configurations"][config_id]
+                mapping = configurations.get(config_id)
+                config_entries.append({
+                    "config_id": config_id, "mapping": mapping,
+                    "substituted": bool(mapping) and any(part != actual for part, actual in mapping.items()),
+                    "jobs": config_group["jobs"], "units": config_group["units"],
+                    "tested_units": config_group["tested"], "passed_units": config_group["passed"],
+                    "failed_units": config_group["failed"],
+                    "pass_rate": ratio(config_group["passed"], config_group["tested"]),
+                    "approvals": sorted(config_group["approvals"].values(),
+                                        key=lambda item: item["approval_id"])})
             result.append({"revision": revision, "jobs": group["jobs"], "units": group["units"],
                            "tested_units": group["tested"], "passed_units": group["passed"],
                            "failed_units": group["failed"], "pass_rate": ratio(group["passed"], group["tested"]),
                            "completed_jobs": group["completed"], "scrapped_jobs": group["scrapped"],
                            "mean_cycle_seconds": sum(durations) // len(durations) if durations else None,
                            "stage_mean_seconds": {name: sum(values) // len(values) for name, values in sorted(group["stage_seconds"].items())},
-                           "supplier_units": dict(sorted(group["suppliers"].items()))})
+                           "supplier_units": dict(sorted(group["suppliers"].items())),
+                           "mixed_configurations": len(config_entries) > 1,
+                           "configurations": config_entries})
         return result
 
     def _quality(self, jobs, steps, tests, events, designs, start, end):

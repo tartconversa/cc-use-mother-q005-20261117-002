@@ -2,7 +2,7 @@ from collections import defaultdict
 from datetime import datetime
 
 from .analytics import CycleAnalytics, window
-from .contracts import DomainError, MissingDependency, duration_seconds, required_text
+from .contracts import DomainError, MissingDependency, configuration_id, duration_seconds, required_text
 from .execution import ExecutionRules
 from .inventory import InventoryRules
 
@@ -19,25 +19,60 @@ class OperationsView:
         from .contracts import timestamp
         at = timestamp(at, "at")
         with self.store.read() as db:
-            design = ExecutionRules(db).designs.get(design_id)
-            inventory = InventoryRules(db)
+            execution = ExecutionRules(db)
+            design = execution.designs.get(design_id)
+            inventory = execution.inventory
+            substitutions = execution.substitutions
             requirements = []
             possible = []
+            resolved_mapping = {}
+            resolved_subs = []
             for part, per_unit in sorted(design["parts"].items()):
+                requested = per_unit * quantity
                 lots = [lot for lot in inventory.availability(part)
                         if lot["received_at"] <= at and not lot["quarantined"]]
                 available = sum(lot["available"] for lot in lots)
-                maximum = available // per_unit
-                possible.append(maximum)
-                requirements.append({"part": part, "per_unit": per_unit,
-                                     "requested": per_unit * quantity, "available": available,
-                                     "lot_ids": [lot["lot_id"] for lot in lots],
-                                     "shortage": max(0, per_unit * quantity - available)})
+                entry = {"part": part, "per_unit": per_unit,
+                         "requested": requested, "available": available,
+                         "lot_ids": [lot["lot_id"] for lot in lots],
+                         "shortage": max(0, requested - available)}
+                approval = substitutions.active_for(design_id, part, at)
+                remaining = substitutions.remaining(approval) if approval else None
+                if approval is not None:
+                    sub_lots = [lot for lot in inventory.availability(approval["substitute_part"])
+                                if lot["received_at"] <= at and not lot["quarantined"]]
+                    entry["substitution"] = {
+                        "approval_id": approval["approval_id"],
+                        "substitute_part": approval["substitute_part"],
+                        "available": sum(lot["available"] for lot in sub_lots),
+                        "lot_ids": [lot["lot_id"] for lot in sub_lots],
+                        "valid_from": approval["valid_from"], "valid_until": approval["valid_until"],
+                        "remaining_units": remaining}
+                else:
+                    entry["substitution"] = None
+                requirements.append(entry)
+                if available >= requested:
+                    resolved_mapping[part] = part
+                    possible.append(available // per_unit)
+                elif (approval is not None and entry["substitution"]["available"] >= requested
+                      and (remaining is None or remaining >= quantity)):
+                    resolved_mapping[part] = approval["substitute_part"]
+                    resolved_subs.append({"part": part,
+                                          "substitute_part": approval["substitute_part"],
+                                          "approval_id": approval["approval_id"]})
+                    stock_units = entry["substitution"]["available"] // per_unit
+                    possible.append(stock_units if remaining is None else min(stock_units, remaining))
+                else:
+                    resolved_mapping[part] = part
+                    possible.append(available // per_unit)
             maximum = min(possible) if possible else 0
             return {"design_id": design_id, "quantity": quantity, "at": at,
                     "feasible": quantity <= maximum and design["state"] == "released"
                     and at >= design["released_at"],
                     "max_units": maximum, "design_state": design["state"],
+                    "resolved_configuration": {
+                        "config_id": configuration_id(design_id, resolved_mapping),
+                        "mapping": resolved_mapping, "substitutions": resolved_subs},
                     "requirements": requirements}
 
     def job_timeline(self, job_id):
@@ -66,6 +101,8 @@ class OperationsView:
                                  "seconds": elapsed, "start": earlier["at"], "end": later["at"]})
             return {"job_id": job_id, "status": job["status"], "milestones": milestones,
                     "gaps": gaps, "reservations": job["reservations"],
+                    "config_id": job["config_id"], "configuration": job["configuration"],
+                    "substitutions": job["substitutions"],
                     "lineage": ExecutionRules(db).lineage(job_id)}
 
     def supplier_exposure(self, product, start, end):

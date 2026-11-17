@@ -10,6 +10,7 @@ from .ledger import EventLedger
 from .measure import MeasurementRules
 from .snapshot import ReportShelf
 from .storage import Store
+from .substitution import SubstitutionRules
 from .throughput import ThroughputView
 
 
@@ -63,6 +64,14 @@ class CycleService:
     def get_test(self, test_id):
         with self.store.read() as db:
             return MeasurementRules(db).trace(test_id)
+
+    def get_approval(self, approval_id):
+        with self.store.read() as db:
+            return SubstitutionRules(db).get(approval_id)
+
+    def get_configuration(self, config_id):
+        with self.store.read() as db:
+            return SubstitutionRules(db).get_configuration(config_id)
 
     def get_event(self, event_id):
         return self.ledger.get(event_id)

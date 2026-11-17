@@ -6,12 +6,13 @@ from .design import DesignRules
 from .execution import ExecutionRules
 from .inventory import InventoryRules
 from .measure import MeasurementRules
+from .substitution import SubstitutionRules
 
 
 KINDS = {
     "design.release", "design.retire", "lot.receive", "lot.quarantine",
     "job.open", "job.stage_start", "job.stage_finish", "job.scrap",
-    "plan.create", "test.record",
+    "plan.create", "test.record", "substitute.approve", "substitute.revoke",
 }
 
 
@@ -51,8 +52,9 @@ class EventLedger:
                 (normalized["source"], normalized["external_id"], normalized["kind"],
                  normalized["occurred_at"], utc_now(), stable_json(normalized["payload"]), digest))
             event_id = cursor.lastrowid
-            self._apply(db, event_id)
-            return self._result(db.execute("SELECT * FROM events WHERE id=?", (event_id,)).fetchone())
+            detail = self._apply(db, event_id)
+            return self._result(db.execute("SELECT * FROM events WHERE id=?", (event_id,)).fetchone(),
+                                detail=detail)
 
     def _apply(self, db, event_id):
         row = db.execute("SELECT * FROM events WHERE id=?", (event_id,)).fetchone()
@@ -66,6 +68,8 @@ class EventLedger:
                 detail = InventoryRules(db).dispatch(kind, payload, row["occurred_at"])
             elif kind.startswith("job."):
                 detail = ExecutionRules(db).dispatch(kind, payload, row["occurred_at"], event_id)
+            elif kind.startswith("substitute."):
+                detail = SubstitutionRules(db).dispatch(kind, payload, row["occurred_at"], event_id)
             else:
                 detail = MeasurementRules(db).dispatch(kind, payload, row["occurred_at"], event_id)
             db.execute("RELEASE SAVEPOINT project_event")
@@ -91,8 +95,9 @@ class EventLedger:
                 raise MissingDependency("event", str(event_id))
             if row["state"] != "waiting":
                 raise DomainError("not_retryable", "only waiting dependency events can retry")
-            self._apply(db, event_id)
-            return self._result(db.execute("SELECT * FROM events WHERE id=?", (event_id,)).fetchone())
+            detail = self._apply(db, event_id)
+            return self._result(db.execute("SELECT * FROM events WHERE id=?", (event_id,)).fetchone(),
+                                detail=detail)
 
     def retry_waiting(self, limit=100):
         if type(limit) is not int or not 1 <= limit <= 1000:
@@ -112,12 +117,15 @@ class EventLedger:
             result["received_at"] = row["received_at"]
             return result
 
-    def _result(self, row, repeated=False):
-        return {"id": row["id"], "source": row["source"], "external_id": row["external_id"],
-                "kind": row["kind"], "occurred_at": row["occurred_at"],
-                "state": row["state"], "error_code": row["error_code"],
-                "error_text": row["error_text"], "attempts": row["attempts"],
-                "fingerprint": row["fingerprint"], "repeated": repeated}
+    def _result(self, row, repeated=False, detail=None):
+        result = {"id": row["id"], "source": row["source"], "external_id": row["external_id"],
+                  "kind": row["kind"], "occurred_at": row["occurred_at"],
+                  "state": row["state"], "error_code": row["error_code"],
+                  "error_text": row["error_text"], "attempts": row["attempts"],
+                  "fingerprint": row["fingerprint"], "repeated": repeated}
+        if detail is not None:
+            result["detail"] = detail
+        return result
 
     def problems(self, product=None):
         with self.store.read() as db:
@@ -130,6 +138,8 @@ class EventLedger:
             payload = event["payload"]
             if event["kind"] == "test.record" and event["state"] == "accepted":
                 event["trace"] = MeasurementRules(db).trace(payload["test_id"])
+            elif event["kind"] == "substitute.approve" and event["state"] == "accepted":
+                event["trace"] = SubstitutionRules(db).get(payload["approval_id"])
             elif event["kind"].startswith("job.") and event["state"] == "accepted":
                 event["trace"] = ExecutionRules(db).lineage(payload["job_id"])
             return event

@@ -1,7 +1,7 @@
 import json
 from collections import defaultdict
 
-from .contracts import DomainError, MissingDependency, fingerprint, required_text
+from .contracts import DomainError, MissingDependency, configuration_id, fingerprint, required_text
 from .design import DesignRules
 from .execution import ExecutionRules
 from .inventory import InventoryRules
@@ -21,6 +21,7 @@ class IntegrityAudit:
             findings.extend(self._design_checks(db, product))
             findings.extend(self._lot_checks(db))
             findings.extend(self._job_checks(db, product))
+            findings.extend(self._substitution_checks(db, product))
             findings.extend(self._test_checks(db, product))
             findings.extend(self._release_checks(db, product))
             findings.sort(key=lambda item: (item["code"], item["subject"]))
@@ -112,10 +113,81 @@ class IntegrityAudit:
                 assigned = {row["part"]: row["quantity"] for row in db.execute(
                     "SELECT l.part,SUM(r.quantity) quantity FROM reservations r JOIN lots l ON l.lot_id=r.lot_id WHERE r.job_id=? GROUP BY l.part",
                     (job_id,))}
-                required = {row["part"]: row["quantity"] * job["quantity"] for row in db.execute(
+                requirements = {row["part"]: row["quantity"] for row in db.execute(
                     "SELECT part,quantity FROM requirements WHERE design_id=?", (job["design_id"],))}
+                mapping_row = db.execute("SELECT mapping FROM configurations WHERE config_id=?",
+                                         (job["config_id"],)).fetchone()
+                if mapping_row is None:
+                    findings.append(self._issue("missing_configuration", job_id))
+                    continue
+                mapping = json.loads(mapping_row["mapping"])
+                if set(mapping) != set(requirements):
+                    findings.append(self._issue("configuration_scope", job_id))
+                    continue
+                required = {}
+                for part, per_unit in requirements.items():
+                    actual = mapping[part]
+                    required[actual] = required.get(actual, 0) + per_unit * job["quantity"]
                 if assigned != required:
                     findings.append(self._issue("bom_allocation", job_id))
+        return findings
+
+    def _substitution_checks(self, db, product):
+        findings = []
+        approvals = {}
+        for row in db.execute("SELECT * FROM substitutions ORDER BY approval_id"):
+            approvals[row["approval_id"]] = row
+            subject = row["approval_id"]
+            if row["valid_until"] <= row["valid_from"]:
+                findings.append(self._issue("validity_window", subject))
+            if row["revoked_at"] is not None and row["revoked_at"] < row["approved_at"]:
+                findings.append(self._issue("revocation_order", subject))
+            parts = {r["part"] for r in db.execute(
+                "SELECT part FROM requirements WHERE design_id=?", (row["design_id"],))}
+            if row["original_part"] not in parts:
+                findings.append(self._issue("substitution_scope", subject))
+            if row["substitute_part"] in parts or row["substitute_part"] == row["original_part"]:
+                findings.append(self._issue("substitution_conflict", subject))
+            if row["max_units"] is not None:
+                consumed = db.execute(
+                    "SELECT COALESCE(SUM(j.quantity),0) FROM job_substitutions js"
+                    " JOIN jobs j ON j.job_id=js.job_id WHERE js.approval_id=?",
+                    (subject,)).fetchone()[0]
+                if consumed > row["max_units"]:
+                    findings.append(self._issue("approval_cap_exceeded", subject))
+        sql = ("SELECT js.*,j.opened_at,j.design_id,d.product AS product_name FROM job_substitutions js"
+               " JOIN jobs j ON j.job_id=js.job_id JOIN designs d ON d.design_id=j.design_id" +
+               (" WHERE d.product=?" if product else "") + " ORDER BY js.job_id,js.part")
+        for link in db.execute(sql, (product,) if product else ()):
+            subject = f"{link['job_id']}/{link['part']}"
+            approval = approvals.get(link["approval_id"])
+            if approval is None:
+                findings.append(self._issue("substitution_link", subject))
+                continue
+            if approval["design_id"] != link["design_id"]:
+                findings.append(self._issue("substitution_scope", subject))
+            if (approval["original_part"], approval["substitute_part"]) != (link["part"], link["substitute_part"]):
+                findings.append(self._issue("substitution_link", subject))
+            if not approval["valid_from"] <= link["opened_at"] < approval["valid_until"]:
+                findings.append(self._issue("substitution_window", subject))
+            if approval["revoked_at"] is not None and link["opened_at"] >= approval["revoked_at"]:
+                findings.append(self._issue("substitution_window", subject))
+        job_sql = ("SELECT j.job_id,j.design_id,j.config_id FROM jobs j JOIN designs d ON d.design_id=j.design_id" +
+                   (" WHERE d.product=?" if product else "") + " ORDER BY j.job_id")
+        for job in db.execute(job_sql, (product,) if product else ()):
+            row = db.execute("SELECT mapping FROM configurations WHERE config_id=?",
+                             (job["config_id"],)).fetchone()
+            if row is None:
+                findings.append(self._issue("missing_configuration", job["job_id"]))
+                continue
+            mapping = json.loads(row["mapping"])
+            if configuration_id(job["design_id"], mapping) != job["config_id"]:
+                findings.append(self._issue("configuration_identity", job["job_id"]))
+            substituted = {part: actual for part, actual in mapping.items() if part != actual}
+            recorded = {link["part"]: link["substitute_part"] for link in db.execute(
+                "SELECT part,substitute_part FROM job_substitutions WHERE job_id=?", (job["job_id"],))}
+            if substituted != recorded:
+                findings.append(self._issue("configuration_mapping", job["job_id"]))
         return findings
 
     def _test_checks(self, db, product):

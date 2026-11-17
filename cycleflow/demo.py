@@ -40,6 +40,33 @@ def scenario():
     ]
 
 
+def substitution_scenario():
+    """Motor stock is exhausted by J1, so engineering approves a time-boxed
+    substitute; J2 is built under that approval with its own configuration."""
+    return [
+        event(13, "lot.receive", 31, {"lot_id": "A1", "part": "motor-alt",
+                                       "supplier": "alt-motors", "quantity": 8}),
+        event(14, "lot.receive", 31, {"lot_id": "S2", "part": "sensor",
+                                       "supplier": "local-sensor", "quantity": 2}),
+        event(15, "substitute.approve", 32, {"approval_id": "AP1", "design_id": "R1",
+                                              "original_part": "motor", "substitute_part": "motor-alt",
+                                              "valid_from": f"{DAY}T09:32:00Z",
+                                              "valid_until": f"{DAY}T10:30:00Z",
+                                              "approved_by": "eng-demo", "max_units": 4,
+                                              "reason": "motor shortage during pilot run"}),
+        event(16, "job.open", 33, {"job_id": "J2", "design_id": "R1", "quantity": 2}),
+        event(17, "job.stage_start", 34, {"job_id": "J2", "stage": "machining"}),
+        event(18, "job.stage_finish", 38, {"job_id": "J2", "stage": "machining"}),
+        event(19, "job.stage_start", 40, {"job_id": "J2", "stage": "assembly"}),
+        event(20, "job.stage_finish", 44, {"job_id": "J2", "stage": "assembly"}),
+        event(21, "job.stage_start", 45, {"job_id": "J2", "stage": "integration"}),
+        event(22, "job.stage_finish", 50, {"job_id": "J2", "stage": "integration"}),
+        event(23, "test.record", 51, {"test_id": "T2", "job_id": "J2",
+                                       "plan_id": "P1", "passed": 1, "failed": 1,
+                                       "note": "substitute motor run"}),
+    ]
+
+
 def run():
     with tempfile.TemporaryDirectory() as directory:
         db = Path(directory) / "cycleflow.sqlite3"
@@ -48,15 +75,32 @@ def run():
         assert first["next_line"] == 5
         rest = service.ingest_batch("sample", scenario())
         assert rest["completed"]
+        extra = service.ingest_batch("substitutes", substitution_scenario())
+        assert extra["completed"]
         report = service.report("robot-arm", START, END)
-        assert report["summary"]["passed_units"] == 3
+        assert report["summary"]["passed_units"] == 4
         assert report["quality"]["publishable"]
+        revision = report["revisions"][0]
+        assert revision["mixed_configurations"]
+        configs = {entry["substituted"]: entry for entry in revision["configurations"]}
+        assert configs[False]["pass_rate"] == "0.75"
+        assert configs[True]["pass_rate"] == "0.5"
+        assert configs[True]["approvals"][0]["approval_id"] == "AP1"
+        job = service.get_job("J2")
+        assert job["configuration"] == {"motor": "motor-alt", "sensor": "sensor"}
+        preview = service.capacity("R1", 2, f"{DAY}T09:33:00Z")
+        assert preview["resolved_configuration"]["config_id"] == job["config_id"]
+        approval = service.get_approval("AP1")
+        assert approval["units_consumed"] == 2 and approval["remaining_units"] == 2
+        configuration = service.get_configuration(job["config_id"])
+        assert configuration["jobs"][0]["job_id"] == "J2"
         frozen = service.publish("jan-demo", "robot-arm", START, END, report["fingerprint"])
-        assert frozen["report"]["summary"]["pass_rate"] == "0.75"
+        assert frozen["report"]["summary"]["pass_rate"] == report["summary"]["pass_rate"]
         audit = IntegrityAudit(service.store).run("robot-arm")
         assert audit["ok"], audit
         return {"batch": {"first_cursor": first["next_line"], "complete": rest["completed"]},
                 "report": report["summary"], "quality": report["quality"],
+                "configurations": revision["configurations"],
                 "release_id": frozen["release_id"], "audit": audit}
 
 

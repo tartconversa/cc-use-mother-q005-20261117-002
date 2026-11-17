@@ -2,6 +2,8 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
+from .contracts import configuration_id, stable_json
+
 
 SCHEMA = """
 PRAGMA foreign_keys=ON;
@@ -25,11 +27,14 @@ CREATE TABLE IF NOT EXISTS lots (
   lot_id TEXT PRIMARY KEY, part TEXT NOT NULL, supplier TEXT NOT NULL,
   received_at TEXT NOT NULL, quantity INTEGER NOT NULL CHECK(quantity>0),
   quarantined INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS configurations (
+  config_id TEXT PRIMARY KEY, design_id TEXT NOT NULL REFERENCES designs(design_id),
+  mapping TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS jobs (
   job_id TEXT PRIMARY KEY, design_id TEXT NOT NULL REFERENCES designs(design_id),
   quantity INTEGER NOT NULL CHECK(quantity>0), opened_at TEXT NOT NULL,
   status TEXT NOT NULL, completed_at TEXT, parent_job TEXT REFERENCES jobs(job_id),
-  failure_reason TEXT);
+  failure_reason TEXT, config_id TEXT REFERENCES configurations(config_id));
 CREATE TABLE IF NOT EXISTS reservations (
   job_id TEXT NOT NULL REFERENCES jobs(job_id), lot_id TEXT NOT NULL REFERENCES lots(lot_id),
   quantity INTEGER NOT NULL CHECK(quantity>0), PRIMARY KEY(job_id, lot_id));
@@ -46,6 +51,17 @@ CREATE TABLE IF NOT EXISTS tests (
   plan_id TEXT NOT NULL REFERENCES plans(plan_id), tested_at TEXT NOT NULL,
   passed INTEGER NOT NULL, failed INTEGER NOT NULL, note TEXT NOT NULL,
   event_id INTEGER NOT NULL REFERENCES events(id));
+CREATE TABLE IF NOT EXISTS substitutions (
+  approval_id TEXT PRIMARY KEY, design_id TEXT NOT NULL REFERENCES designs(design_id),
+  original_part TEXT NOT NULL, substitute_part TEXT NOT NULL,
+  max_units INTEGER CHECK(max_units>0), valid_from TEXT NOT NULL, valid_until TEXT NOT NULL,
+  approved_by TEXT NOT NULL, reason TEXT NOT NULL, approved_at TEXT NOT NULL,
+  revoked_at TEXT, revoke_reason TEXT, revoked_by TEXT,
+  event_id INTEGER NOT NULL REFERENCES events(id), revoke_event_id INTEGER REFERENCES events(id));
+CREATE TABLE IF NOT EXISTS job_substitutions (
+  job_id TEXT NOT NULL REFERENCES jobs(job_id), part TEXT NOT NULL,
+  substitute_part TEXT NOT NULL, approval_id TEXT NOT NULL REFERENCES substitutions(approval_id),
+  PRIMARY KEY(job_id, part));
 CREATE TABLE IF NOT EXISTS releases (
   release_id TEXT PRIMARY KEY, product TEXT NOT NULL, window_start TEXT NOT NULL,
   window_end TEXT NOT NULL, created_at TEXT NOT NULL, report TEXT NOT NULL,
@@ -64,8 +80,25 @@ class Store:
         db = self.connect()
         try:
             db.executescript(SCHEMA)
+            self._migrate(db)
         finally:
             db.close()
+
+    def _migrate(self, db):
+        columns = {row[1] for row in db.execute("PRAGMA table_info(jobs)")}
+        if "config_id" not in columns:
+            db.execute("ALTER TABLE jobs ADD COLUMN config_id TEXT REFERENCES configurations(config_id)")
+        # Jobs recorded before configurations existed could only have used
+        # original parts, so their identity mapping is the truthful backfill.
+        pending = db.execute(
+            "SELECT job_id,design_id,opened_at FROM jobs WHERE config_id IS NULL").fetchall()
+        for job in pending:
+            mapping = {row["part"]: row["part"] for row in db.execute(
+                "SELECT part FROM requirements WHERE design_id=? ORDER BY part", (job["design_id"],))}
+            config_id = configuration_id(job["design_id"], mapping)
+            db.execute("INSERT OR IGNORE INTO configurations(config_id,design_id,mapping,created_at)"
+                       " VALUES(?,?,?,?)", (config_id, job["design_id"], stable_json(mapping), job["opened_at"]))
+            db.execute("UPDATE jobs SET config_id=? WHERE job_id=?", (config_id, job["job_id"]))
 
     def connect(self):
         db = sqlite3.connect(self.path, timeout=15, isolation_level=None)

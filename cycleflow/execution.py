@@ -1,6 +1,7 @@
 from .contracts import DomainError, MissingDependency, duration_seconds, keys, nonnegative_int, required_text
 from .design import DesignRules
 from .inventory import InventoryRules
+from .substitution import SubstitutionRules
 
 
 STAGES = ("machining", "assembly", "integration")
@@ -11,6 +12,53 @@ class ExecutionRules:
         self.db = db
         self.designs = DesignRules(db)
         self.inventory = InventoryRules(db)
+        self.substitutions = SubstitutionRules(db)
+
+    def resolve_configuration(self, design, quantity, occurred_at):
+        """Map every required part to the actual part a job of `quantity` would
+        use at `occurred_at`: original stock first, then a substitute covered by
+        an approval valid at that business time. One job gets one configuration,
+        so yield stays attributable. Raises an explained shortage otherwise."""
+        mapping, allocations, used = {}, [], {}
+        explanations = []
+        for part, per_unit in sorted(design["parts"].items()):
+            required = per_unit * quantity
+            available = self.inventory.available_at(part, occurred_at)
+            if available >= required:
+                mapping[part] = part
+                allocations.extend(self.inventory.choose(part, required, occurred_at))
+                continue
+            approval = self.substitutions.active_for(design["design_id"], part, occurred_at)
+            reason = None
+            if approval is None:
+                known = self.substitutions.known_for(design["design_id"], part)
+                reason = "no active approval"
+                if known:
+                    windows = ", ".join(
+                        f"{item['approval_id']}[{item['valid_from']}..{item['valid_until']}"
+                        + (f" revoked@{item['revoked_at']}" if item["revoked_at"] else "")
+                        for item in known)
+                    reason += f" at {occurred_at} ({windows})"
+            else:
+                remaining = self.substitutions.remaining(approval)
+                if remaining is not None and remaining < quantity:
+                    reason = (f"approval {approval['approval_id']} has {remaining} of"
+                              f" {approval['max_units']} units left, job needs {quantity}")
+                else:
+                    substitute = approval["substitute_part"]
+                    sub_available = self.inventory.available_at(substitute, occurred_at)
+                    if sub_available < required:
+                        reason = (f"substitute {substitute} under {approval['approval_id']} short:"
+                                  f" need {required}, available {sub_available}")
+            if reason is not None:
+                explanations.append(f"{part}: need {required}, original available {available}; {reason}")
+                continue
+            mapping[part] = approval["substitute_part"]
+            used[part] = approval
+            allocations.extend(self.inventory.choose(approval["substitute_part"], required, occurred_at))
+        if explanations:
+            raise DomainError("shortage", "; ".join(explanations), 409)
+        return mapping, allocations, used
 
     def open(self, payload, occurred_at):
         keys(payload, {"job_id", "design_id", "quantity"},
@@ -33,10 +81,21 @@ class ExecutionRules:
                 raise DomainError("invalid_rework", "rework must stay in same product")
             if occurred_at < parent["opened_at"]:
                 raise DomainError("time_order", "rework precedes original job")
-        self.db.execute("INSERT INTO jobs(job_id,design_id,quantity,opened_at,status,parent_job) VALUES(?,?,?,?,?,?)",
-                        (job_id, design_id, quantity, occurred_at, "open", parent_id))
-        allocations = self.inventory.reserve(job_id, design, quantity, occurred_at)
-        return {"job_id": job_id, "status": "open", "allocations": allocations}
+        mapping, allocations, used = self.resolve_configuration(design, quantity, occurred_at)
+        config_id = self.substitutions.ensure_configuration(design_id, mapping, occurred_at)
+        self.db.execute("INSERT INTO jobs(job_id,design_id,quantity,opened_at,status,parent_job,config_id)"
+                        " VALUES(?,?,?,?,?,?,?)",
+                        (job_id, design_id, quantity, occurred_at, "open", parent_id, config_id))
+        recorded = self.inventory.insert_reservations(job_id, allocations)
+        for part, approval in sorted(used.items()):
+            self.db.execute(
+                "INSERT INTO job_substitutions(job_id,part,substitute_part,approval_id) VALUES(?,?,?,?)",
+                (job_id, part, approval["substitute_part"], approval["approval_id"]))
+        return {"job_id": job_id, "status": "open", "config_id": config_id,
+                "configuration": mapping, "allocations": recorded,
+                "substitutions": [{"part": part, "substitute_part": approval["substitute_part"],
+                                   "approval_id": approval["approval_id"]}
+                                  for part, approval in sorted(used.items())]}
 
     def start_stage(self, payload, occurred_at, event_id):
         keys(payload, {"job_id", "stage"})
@@ -102,6 +161,8 @@ class ExecutionRules:
             raise MissingDependency("job", job_id)
         result = dict(row)
         result["design"] = self.designs.get(result["design_id"])
+        result["configuration"] = self.substitutions.mapping_for(result["config_id"])
+        result["substitutions"] = self.substitutions.job_substitutions(job_id)
         result["reservations"] = self.inventory.reservations(job_id)
         result["stages"] = [dict(r) for r in self.db.execute(
             "SELECT stage,started_at,completed_at,event_id FROM job_steps WHERE job_id=? ORDER BY started_at,stage", (job_id,))]
@@ -116,7 +177,8 @@ class ExecutionRules:
                 raise DomainError("cyclic_rework", "job lineage is cyclic")
             seen.add(current)
             job = self.get(current)
-            result.append({"job_id": current, "status": job["status"], "design_id": job["design_id"]})
+            result.append({"job_id": current, "status": job["status"],
+                           "design_id": job["design_id"], "config_id": job["config_id"]})
             current = job["parent_job"]
         return result
 

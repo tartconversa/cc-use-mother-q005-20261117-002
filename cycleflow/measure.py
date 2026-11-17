@@ -74,6 +74,9 @@ class MeasurementRules:
             raise MissingDependency("test", test_id)
         test = dict(row)
         test["plan"] = self.get_plan(test["plan_id"])
+        job = self.jobs.get(test["job_id"])
+        test["configuration"] = {"config_id": job["config_id"], "mapping": job["configuration"]}
+        test["substitutions"] = job["substitutions"]
         test["job_lineage"] = self.jobs.lineage(test["job_id"])
         test["reservations"] = self.jobs.inventory.reservations(test["job_id"])
         return test

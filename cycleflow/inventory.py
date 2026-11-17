@@ -57,10 +57,14 @@ class InventoryRules:
             raise DomainError("shortage", f"insufficient available {part}: need {required}, missing {remaining}", 409)
         return allocations
 
-    def reserve(self, job_id, design, quantity, occurred_at):
-        allocations = []
-        for part, per_unit in sorted(design["parts"].items()):
-            allocations.extend(self.choose(part, per_unit * quantity, occurred_at))
+    def available_at(self, part, at):
+        total = 0
+        for row in self.db.execute(
+                "SELECT lot_id FROM lots WHERE part=? AND received_at<=? AND quarantined=0", (part, at)):
+            total += self.get(row["lot_id"])["available"]
+        return total
+
+    def insert_reservations(self, job_id, allocations):
         for lot_id, take in allocations:
             self.db.execute("INSERT INTO reservations(job_id,lot_id,quantity) VALUES(?,?,?)",
                             (job_id, lot_id, take))

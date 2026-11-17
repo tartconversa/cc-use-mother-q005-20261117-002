@@ -109,6 +109,14 @@ def create_app(db_path=None):
     def test(test_id: str):
         return service.get_test(test_id)
 
+    @app.get("/substitutions/{approval_id}")
+    def substitution(approval_id: str):
+        return service.get_approval(approval_id)
+
+    @app.get("/configurations/{config_id}")
+    def configuration(config_id: str):
+        return service.get_configuration(config_id)
+
     @app.get("/reports/{product}")
     def report(product: str, window_start: str, window_end: str):
         return service.report(product, window_start, window_end)

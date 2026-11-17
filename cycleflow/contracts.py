@@ -67,6 +67,13 @@ def fingerprint(value) -> str:
     return hashlib.sha256(stable_json(value).encode("utf-8")).hexdigest()
 
 
+def configuration_id(design_id: str, mapping: dict) -> str:
+    """Deterministic identity of an assembly configuration: which actual part
+    covers every required part of one design. Same inputs, same identity, so
+    capacity previews, jobs, tests and reports all share it."""
+    return "cfg-" + fingerprint({"design_id": design_id, "mapping": mapping})[:16]
+
+
 def duration_seconds(start: str, end: str) -> int:
     seconds = int((datetime.fromisoformat(end) - datetime.fromisoformat(start)).total_seconds())
     if seconds < 0:
